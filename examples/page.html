@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>demo-chrome-example</title>
+  <style>
+    body { font-family: sans-serif; background: #1c1b19; color: #f0efe7; margin: 48px; }
+    button { font-size: 1.2rem; padding: 0.6rem 1.2rem; }
+    #out { margin-top: 1.5rem; min-height: 2rem; }
+  </style>
+</head>
+<body>
+  <h1>record.RecordSession</h1>
+  <p>Chromium is driven over CDP. The pixels are XGetImage of this window.</p>
+  <button id="go">Take the challenge</button>
+  <p id="out"></p>
+  <script>
+    document.getElementById("go").onclick = () => {
+      document.getElementById("out").textContent = "hello world";
+    };
+  </script>
+</body>
+</html>
