@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record a Chromium window. The driver is CDP. The pixels are XGetImage."""
+"""Record a Chromium window. The driver is CDP. The pixels are the live window."""
 
 from __future__ import annotations
 

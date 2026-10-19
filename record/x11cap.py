@@ -283,6 +283,49 @@ def window_pid(dpy, win: int) -> int:
     return val
 
 
+def _window_live(wid: int) -> bool:
+    """False for a stale tree id. xwininfo fails with BadDrawable on those."""
+    try:
+        subprocess.check_output(
+            ["xwininfo", "-id", hex(wid)],
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+def find_by_class(dpy, wm_class: str, min_w: int = 640, min_h: int = 400) -> int:
+    """Top-level window whose WM_CLASS contains `wm_class`."""
+    root = x11.XDefaultRootWindow(dpy)
+    best = 0
+    best_area = 0
+    for win in walk_windows(dpy, root):
+        if wm_class.lower() not in window_class(dpy, win).lower():
+            continue
+        w, h = geometry(dpy, win)
+        if w >= min_w and h >= min_h and w * h > best_area:
+            best, best_area = win, w * h
+    return best
+
+
+def window_class(dpy, win: int) -> str:
+    atom = x11.XInternAtom(dpy, b"WM_CLASS", False)
+    actual = c_ulong()
+    actual_fmt = c_int()
+    nitems = c_ulong()
+    nbytes = c_ulong()
+    prop = c_void_p()
+    if x11.XGetWindowProperty(
+        dpy, win, atom, 0, 64, False, 31,
+        byref(actual), byref(actual_fmt), byref(nitems), byref(nbytes), byref(prop),
+    ) != 0 or nitems.value < 1 or not prop:
+        return ""
+    raw = ctypes.string_at(prop, nitems.value)
+    x11.XFree(prop)
+    return raw.replace(b"\x00", b" ").decode("latin1", "replace")
+
+
 def find_window(dpy, title: str, min_w: int = 640, min_h: int = 400, pid: int | None = None) -> int:
     needle = title.lower()
     debug = os.environ.get("RECORD_DEBUG")
@@ -305,14 +348,24 @@ def find_window(dpy, title: str, min_w: int = 640, min_h: int = 400, pid: int | 
         # the tree line quotes the window's own name; don't match a child's line
         # that merely sits under a parent titled Arcade Coder
         quoted = f'"{title}"' in line
+        # A dead id still parses out of a stale tree line, and XGetGeometry
+        # on it aborts the process. Refuse it before asking X.
+        if not _window_live(wid):
+            continue
         named = needle in window_name(dpy, wid).lower()
         if not quoted and not named:
             continue
-        w, h = geometry(dpy, wid)
+        # A dead id (BadWindow) still parses out of a stale tree line. Skip it.
+        try:
+            w, h = geometry(dpy, wid)
+        except Exception:
+            continue
+        if w < 2 or h < 2:
+            continue
         ok = _pid_ok(dpy, wid, pid)
         if debug and (needle in line.lower() or named):
             print(f"  cand {wid:#x} {w}x{h} quoted={quoted} named={named} pidok={ok} line={line.strip()[:100]}", file=_sys.stderr)
-        if w >= min_w and h >= min_h and ok:
+        if w >= min_w and h >= min_h and ok and _window_live(wid):
             if debug:
                 print(f"  PICK tree {wid:#x}", file=_sys.stderr)
             return wid
@@ -325,7 +378,7 @@ def find_window(dpy, title: str, min_w: int = 640, min_h: int = 400, pid: int | 
         m = re.search(r"Window id:\s+(0x[0-9a-fA-F]+)", out)
         if m:
             wid = int(m.group(1), 16)
-            if _pid_ok(dpy, wid, pid):
+            if _pid_ok(dpy, wid, pid) and _window_live(wid):
                 return wid
     except subprocess.CalledProcessError:
         pass
@@ -335,7 +388,7 @@ def find_window(dpy, title: str, min_w: int = 640, min_h: int = 400, pid: int | 
         if needle not in name:
             continue
         w, h = geometry(dpy, win)
-        if w >= min_w and h >= min_h and _pid_ok(dpy, win, pid):
+        if w >= min_w and h >= min_h and _pid_ok(dpy, win, pid) and _window_live(win):
             return win
     return 0
 
@@ -380,6 +433,10 @@ def grab_tree_bgr(dpy, win: int, w: int, h: int) -> bytes | None:
 
     XGetImage on a parent is the parent's own pixels. xterm draws the
     glyphs on the VT child, so a parent grab is a solid title-bar colour.
+
+    XCopyArea raises BadMatch on some terminals. libX11 aborts the process
+    by default, which froze the security demo on its first frame. Swallow
+    that and let the caller try a root grab instead.
     """
     screen = x11.XDefaultScreen(dpy)
     depth = x11.XDefaultDepth(dpy, screen)
@@ -390,9 +447,25 @@ def grab_tree_bgr(dpy, win: int, w: int, h: int) -> bytes | None:
     if not gc:
         x11.XFreePixmap(dpy, pix)
         return None
+    err = c_int(0)
+
+    @CFUNCTYPE(c_int, c_void_p, c_void_p)
+    def on_err(_d, _e):
+        err.value = 1
+        return 0
+
+    # Keep the callback alive across XSync. A dropped ctypes function
+    # pointer is what makes the next X error abort the process.
+    grab_tree_bgr._handler = on_err
+    prev = x11.XSetErrorHandler(on_err)
     x11.XSetSubwindowMode(dpy, gc, IncludeInferiors)
     x11.XCopyArea(dpy, win, pix, gc, 0, 0, w, h, 0, 0)
     x11.XSync(dpy, 0)
+    x11.XSetErrorHandler(prev)
+    if err.value:
+        x11.XFreeGC(dpy, gc)
+        x11.XFreePixmap(dpy, pix)
+        return None
     img_p = x11.XGetImage(dpy, pix, 0, 0, w, h, AllPlanes, ZPixmap)
     x11.XFreeGC(dpy, gc)
     x11.XFreePixmap(dpy, pix)
@@ -418,13 +491,26 @@ def client_of(dpy, win: int) -> int:
 
 
 def grab_root_bgr(dpy, win: int, w: int, h: int) -> bytes | None:
-    """What is on the screen at this window. Last resort for Xft/xterm."""
+    """Screen pixels of this window only, clamped so the desktop cannot leak in."""
     root = x11.XDefaultRootWindow(dpy)
     rx = c_int()
     ry = c_int()
     child = c_ulong()
     x11.XTranslateCoordinates(dpy, win, root, 0, 0, byref(rx), byref(ry), byref(child))
-    img_p = x11.XGetImage(dpy, root, int(rx.value), int(ry.value), w, h, AllPlanes, ZPixmap)
+    sx, sy = int(rx.value), int(ry.value)
+    sw, sh = geometry(dpy, root)
+    # A window that hangs off the display must not pull in neighbouring pixels.
+    if sx < 0:
+        w += sx
+        sx = 0
+    if sy < 0:
+        h += sy
+        sy = 0
+    w = min(w, max(0, sw - sx))
+    h = min(h, max(0, sh - sy))
+    if w < 2 or h < 2:
+        return None
+    img_p = x11.XGetImage(dpy, root, sx, sy, w, h, AllPlanes, ZPixmap)
     return _image_to_bgr(img_p, w, h)
 
 
@@ -444,28 +530,50 @@ def roughly_blank(frame: bytes | None) -> bool:
     return n == 0 or other / n < 0.004
 
 
+def grab_window(dpy, win: int, w: int, h: int, redirected: bool = False) -> bytes | None:
+    """One frame of this window, including what the compositor actually painted.
+
+    Three draws never land in the same pixmap:
+
+    - A parent ``XGetImage`` misses children (xterm's VT, LibreOffice's grid).
+    - ``XCopyArea IncludeInferiors`` gets those children, but not Cairo glyphs
+      that GTK paints only into the composited screen.
+    - A root grab has those glyphs, but misses children the compositor never
+      copied onto the root, and it includes the desktop around a shaped frame.
+
+    Start from the child copy. Where that pixmap is empty, take the screen
+    pixel of this window. Never the other way around: the screen is black in
+    the holes the compositor left, and those holes are exactly the child draws.
+    """
+    base = grab_tree_bgr(dpy, win, w, h)
+    if base is None:
+        client = client_of(dpy, win)
+        if client != win:
+            cw, ch = geometry(dpy, client)
+            if cw == w and ch == h:
+                base = grab_tree_bgr(dpy, client, w, h)
+        if base is None:
+            base = grab_bgr(dpy, win, w, h, redirected)
+    screen = grab_root_bgr(dpy, win, w, h)
+    if base is None:
+        return screen
+    if screen is None or len(screen) != len(base):
+        return base
+    out = bytearray(base)
+    n = len(out) // 4
+    for i in range(n):
+        o = i * 4
+        if out[o] < 8 and out[o + 1] < 8 and out[o + 2] < 8:
+            if screen[o] >= 8 or screen[o + 1] >= 8 or screen[o + 2] >= 8:
+                out[o] = screen[o]
+                out[o + 1] = screen[o + 1]
+                out[o + 2] = screen[o + 2]
+    return bytes(out)
+
+
 def grab_visible(dpy, win: int, w: int, h: int, redirected: bool = False) -> bytes | None:
-    """Best-effort pixels for a native window, including xterm."""
-    tree = grab_tree_bgr(dpy, win, w, h)
-    if tree is not None and not roughly_blank(tree):
-        return tree
-    client = client_of(dpy, win)
-    if client != win:
-        cw, ch = geometry(dpy, client)
-        if cw == w and ch == h:
-            inner = grab_tree_bgr(dpy, client, w, h)
-            if inner is not None and not roughly_blank(inner):
-                return inner
-            inner = grab_bgr(dpy, client, w, h, redirected)
-            if inner is not None and not roughly_blank(inner):
-                return inner
-    direct = grab_bgr(dpy, win, w, h, redirected)
-    if direct is not None and not roughly_blank(direct):
-        return direct
-    root = grab_root_bgr(dpy, win, w, h)
-    if root is not None and not roughly_blank(root):
-        return root
-    return tree or direct or root
+    """Best-effort pixels for a native window, including xterm and GTK."""
+    return grab_window(dpy, win, w, h, redirected)
 
 
 def hide_cursor(dpy) -> bool:
