@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Record a GTK terminal. The pixels are XGetImage of that window.
+"""Record a GTK terminal. The pixels are grab_window of that window.
 
-xterm's Xft glyphs often never appear in XGetImage. xfce4-terminal does.
+xterm's Xft glyphs often never appear in a window XGetImage. xfce4-terminal does.
 Stdout stays in the window. A redirected log is a blank movie.
 """
 

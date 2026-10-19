@@ -1,7 +1,8 @@
 """Record a live native X11 window to mp4 (no Chromium).
 
-Pixels come from XGetImage (same as RecordSession). Input is XTest so the
-app sees real pointer motion — useful when the UI follows the mouse.
+Pixels come from grab_window: the window and its children, with pixmap holes
+filled from the screen pixels of that window. Input is XTest so the app sees
+real pointer motion — useful when the UI follows the mouse.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -44,6 +46,13 @@ x11cap.x11.XWarpPointer.argtypes = [
 ]
 
 
+def swap_rb(frame: bytes) -> bytes:
+    """This display stores RGB in a buffer ffmpeg is told is BGR."""
+    out = bytearray(frame)
+    out[0::4], out[2::4] = out[2::4], out[0::4]
+    return bytes(out)
+
+
 def put_pixel(frame: bytearray, w: int, h: int, x: int, y: int, bgr: tuple[int, int, int]) -> None:
     if 0 <= x < w and 0 <= y < h:
         i = (y * w + x) * 4
@@ -67,6 +76,48 @@ def overlay_pointer(frame: bytes, w: int, h: int, x: int, y: int) -> bytes:
     return bytes(out)
 
 
+def grab_xwd(wid: int, w: int, h: int) -> bytes | None:
+    """Read the window's own pixmap. Root grabs miss depth-32 terminals."""
+    try:
+        raw = subprocess.check_output(
+            ["xwd", "-id", hex(wid), "-silent"],
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if len(raw) < 100:
+        return None
+    hs = struct.unpack(">I", raw[:4])[0]
+    n = hs // 4
+    if len(raw) < n * 4:
+        return None
+    fields = struct.unpack(">" + "I" * n, raw[: n * 4])
+    if len(fields) < 20:
+        return None
+    src_w, src_h = fields[4], fields[5]
+    bpl, ncolors = fields[12], fields[19]
+    off = hs + ncolors * 12
+    need = bpl * src_h
+    if src_w < 2 or src_h < 2 or len(raw) < off + need:
+        return None
+    pix = raw[off : off + need]
+    # XWD is BGRA, top-left origin. ffmpeg wants tightly packed bgr0.
+    out = bytearray(w * h * 4)
+    copy_w = min(w, src_w)
+    copy_h = min(h, src_h)
+    for y in range(copy_h):
+        src = y * bpl
+        dst = y * w * 4
+        row = pix[src : src + copy_w * 4]
+        # drop alpha: keep B,G,R and write 0
+        for x in range(copy_w):
+            i = x * 4
+            out[dst + i] = row[i]
+            out[dst + i + 1] = row[i + 1]
+            out[dst + i + 2] = row[i + 2]
+    return bytes(out)
+
+
 class WindowRecord:
     """Capture `title` with XGetImage while driving the pointer with XTest."""
 
@@ -86,6 +137,7 @@ class WindowRecord:
         hide_cursor: bool = True,
         overlay_pointer: bool = True,
         pid: int | None = None,
+        swap_rb: bool = False,
     ) -> None:
         self.title = title
         self.out = Path(out)
@@ -96,6 +148,7 @@ class WindowRecord:
         self.hide_cursor = hide_cursor
         self.overlay_pointer = overlay_pointer
         self.pid = pid
+        self.swap_rb = swap_rb
         self.children: list[subprocess.Popen] = []
         self._dpy = None
         self._cap_dpy = None
@@ -164,6 +217,33 @@ class WindowRecord:
             die(f"bad window size {w}x{h}")
         w -= w % 2
         h -= h % 2
+        # GTK client-side shadows record as a black margin. Remember the
+        # extents and crop pixels in the capture loop. The X window size
+        # stays the full frame so the grab origin matches.
+        self._crop = (0, 0, 0, 0)  # left, top, right, bottom
+        try:
+            ext = subprocess.check_output(
+                ["xprop", "-id", hex(wid), "_GTK_FRAME_EXTENTS"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            if "=" in ext:
+                left, right, top, bottom = [int(p.strip()) for p in ext.split("=", 1)[1].split(",")]
+                if (
+                    left >= 0
+                    and top >= 0
+                    and right >= 0
+                    and bottom >= 0
+                    and left + right < w - 80
+                    and top + bottom < h - 80
+                ):
+                    self._crop = (left, top, right, bottom)
+                    cw = (w - left - right) & ~1
+                    ch = (h - top - bottom) & ~1
+                    print(f"cropping CSD shadow l{left} t{top} r{right} b{bottom} -> {cw}x{ch}", file=sys.stderr)
+                    w, h = cw, ch
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            pass
         self._w, self._h = w, h
         x11cap.x11.XSetInputFocus(dpy, wid, 2, 0)
         x11cap.x11.XFlush(dpy)
@@ -177,10 +257,19 @@ class WindowRecord:
         else:
             print("warning: first frames may be blank", file=sys.stderr)
 
+    def window_id(self) -> str:
+        return hex(self._wid)
+
     def start_capture(self) -> None:
         dpy, wid, w, h = self._dpy, self._wid, self._w, self._h
         redirected = self._redirected
         self.out.parent.mkdir(parents=True, exist_ok=True)
+        # A maximized window is too wide to watch. Scale the encode, not the grab,
+        # so the clip is still the whole window.
+        scale = getattr(self, "scale", None)
+        vf = []
+        if scale:
+            vf = ["-vf", f"scale={scale}:flags=lanczos"]
         ff = subprocess.Popen(
             [
                 ffmpeg_bin(),
@@ -195,6 +284,7 @@ class WindowRecord:
                 str(self.fps),
                 "-i",
                 "-",
+                *vf,
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -221,6 +311,9 @@ class WindowRecord:
         self._cap_dpy = cap_dpy
 
         def pump() -> None:
+            import struct
+            import tempfile
+
             last = None
             tick = 1.0 / self.fps
             t0 = time.monotonic()
@@ -232,12 +325,33 @@ class WindowRecord:
                     continue
                 if time.monotonic() - t0 > self.max_sec:
                     break
-                frame = x11cap.grab_visible(cap_dpy, wid, w, h, redirected)
+                # grab_window copies children and fills pixmap holes from the
+                # screen pixels of this window. Crop the client-side shadow,
+                # which records as a black margin, without shrinking the grab.
+                full_w, full_h = x11cap.geometry(cap_dpy, wid)
+                full_w -= full_w % 2
+                full_h -= full_h % 2
+                frame = x11cap.grab_window(cap_dpy, wid, full_w, full_h, redirected)
+                left, top, right, bottom = self._crop
+                if frame is not None and len(frame) >= full_w * full_h * 4 and (left or top or right or bottom):
+                    cw = (full_w - left - right) & ~1
+                    ch = (full_h - top - bottom) & ~1
+                    if cw == w and ch == h:
+                        row = cw * 4
+                        packed = bytearray(ch * row)
+                        for y in range(ch):
+                            src = ((y + top) * full_w + left) * 4
+                            packed[y * row : (y + 1) * row] = frame[src : src + row]
+                        frame = bytes(packed)
+                if frame is not None and len(frame) != w * h * 4:
+                    frame = None
                 if frame is None:
                     frame = last
                 if frame is None:
                     time.sleep(tick)
                     continue
+                if getattr(self, "swap_rb", False):
+                    frame = swap_rb(frame)
                 last = frame
                 ptr = self._ptr
                 shown = overlay_pointer(frame, w, h, *ptr) if (self.overlay_pointer and ptr) else frame

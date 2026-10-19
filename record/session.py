@@ -172,12 +172,22 @@ class RecordSession:
         wid = 0
         for _ in range(80):
             wid = x11cap.find_window(dpy, self.title)
+            if not wid and self.wm_class:
+                wid = x11cap.find_by_class(dpy, self.wm_class)
             if wid:
                 break
             time.sleep(0.15)
         if not wid:
             die("demo window not found")
         self._wid = wid
+        # Chromium --app names the window after the page, not --title, and this
+        # display's tree listing keeps a dead id that still matches old titles.
+        # The --class flag is unique per recording; capture that window.
+        if self.wm_class:
+            found = x11cap.find_by_class(dpy, self.wm_class)
+            if found:
+                wid = found
+                self._wid = wid
         redirected, hidden = x11cap.redirect_and_hide_cursor(dpy, wid)
         self._redirected = redirected
         self._hidden = hidden
@@ -351,7 +361,6 @@ class RecordSession:
 
     def __enter__(self) -> "RecordSession":
         self.attach_chrome()
-        self.start_capture()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
